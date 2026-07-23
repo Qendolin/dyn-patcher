@@ -8,11 +8,13 @@ import javax.tools.StandardJavaFileManager;
 import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.net.URI;
-import java.util.HashMap;
-import java.util.Map;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class MemoryJavaFileManager extends ForwardingJavaFileManager<StandardJavaFileManager> {
-    private final Map<String, byte[]> compiledClasses = new HashMap<>();
+    private final Map<String, byte[]> compiledClasses = new ConcurrentHashMap<>();
+    private final Map<String, List<String>> sourceToClasses = new ConcurrentHashMap<>();
 
     public MemoryJavaFileManager(StandardJavaFileManager fileManager) {
         super(fileManager);
@@ -20,6 +22,13 @@ public class MemoryJavaFileManager extends ForwardingJavaFileManager<StandardJav
 
     @Override
     public JavaFileObject getJavaFileForOutput(Location location, String className, JavaFileObject.Kind kind, FileObject sibling) {
+        if (sibling != null) {
+            try {
+                String sourcePath = Paths.get(sibling.toUri()).toAbsolutePath().toString();
+                sourceToClasses.computeIfAbsent(sourcePath, k -> Collections.synchronizedList(new ArrayList<>())).add(className);
+            } catch (Exception ignored) {}
+        }
+
         return new SimpleJavaFileObject(URI.create("string:///" + className.replace('.', '/') + kind.extension), kind) {
             @Override
             public OutputStream openOutputStream() {
@@ -27,7 +36,6 @@ public class MemoryJavaFileManager extends ForwardingJavaFileManager<StandardJav
                     @Override
                     public void close() throws java.io.IOException {
                         super.close();
-                        // When ECJ finishes writing a class, save the byte array!
                         compiledClasses.put(className, toByteArray());
                     }
                 };
@@ -37,5 +45,9 @@ public class MemoryJavaFileManager extends ForwardingJavaFileManager<StandardJav
 
     public Map<String, byte[]> getCompiledClasses() {
         return compiledClasses;
+    }
+
+    public Map<String, List<String>> getSourceToClasses() {
+        return sourceToClasses;
     }
 }

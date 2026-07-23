@@ -1,93 +1,217 @@
 package com.qendolin.dynpatcher;
 
-
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.reflect.TypeToken;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.impl.launch.FabricLauncherBase;
+import org.spongepowered.asm.mixin.Mixins;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
 import org.objectweb.asm.tree.ClassNode;
 
+import java.io.Reader;
+import java.io.Writer;
+import java.lang.reflect.Type;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.nio.file.Paths;
+import java.nio.file.attribute.FileTime;
+import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-
 public class DynamicMixinPlugin implements IMixinConfigPlugin {
-    private final List<String> dynamicallyCompiledMixins = new ArrayList<>();
 
-    @Override
-    public void onLoad(String mixinPackage) {
-        try {
-            // 1. Locate the source files (e.g., config/dynamic_mixins/)
-            Path sourceDir = FabricLoader.getInstance().getConfigDir().resolve("dynamic_mixins");
-            if (!Files.exists(sourceDir)) {
-                Files.createDirectories(sourceDir);
-                // In a real mod, you might extract an example .java file here
-                return;
-            }
+    private final List<String> configNamesToLoad = new ArrayList<>();
 
-            // 2. Read all .java files
-            List<Path> sourceFiles;
-            try (Stream<Path> walk = Files.walk(sourceDir)) {
-                sourceFiles = walk.filter(p -> p.toString().endsWith(".java")).collect(Collectors.toList());
-            }
+    public static class CacheEntry {
+        public long lastModified;
+        public List<String> classes;
 
-            if (sourceFiles.isEmpty()) return;
-
-            System.out.println("[DynamicMixins] Found " + sourceFiles.size() + " runtime mixin sources. Compiling...");
-
-            // 3. Compile the Java files using ECJ
-            Map<String, byte[]> compiledClasses = EcjRuntimeCompiler.compile(sourceFiles);
-
-            // 4. Create a hidden NIO temporary directory to act as our virtual classpath
-            Path dynamicRoot = Files.createTempDirectory("dynamic_mixins_out_");
-
-            // 5. Write the compiled byte[] arrays to this directory
-            for (Map.Entry<String, byte[]> entry : compiledClasses.entrySet()) {
-                // 1. ECJ sometimes returns keys with slashes. Normalize to standard Java dots.
-                String fqcn = entry.getKey().replace('/', '.');
-
-                // 2. Write the file to the virtual classpath folder
-                Path classPath = dynamicRoot.resolve(fqcn.replace('.', '/') + ".class");
-                Files.createDirectories(classPath.getParent());
-                Files.write(classPath, entry.getValue());
-
-                // 3. Format the name for the Mixin Engine
-                // Mixin requires the class name to be RELATIVE to the package defined in your mixins.json!
-                if (fqcn.startsWith(mixinPackage + ".")) {
-                    String relativeName = fqcn.substring(mixinPackage.length() + 1);
-                    dynamicallyCompiledMixins.add(relativeName);
-                    System.out.println("[DynamicMixins] Staged and registered Mixin: " + relativeName);
-                } else {
-                    System.err.println("[DynamicMixins] WARNING: " + fqcn + " does not belong to the package '" + mixinPackage + "' defined in your mixins.json! It will be skipped.");
-                }
-            }
-
-            // 6. THE MAGIC: Tell Fabric to append this folder to the runtime Classpath.
-            // Knot will natively treat this folder as a jar/resource root!
-            FabricLauncherBase.getLauncher().addToClassPath(dynamicRoot);
-
-        } catch (Exception e) {
-            throw new RuntimeException("[DynamicMixins] Critical failure during runtime mixin compilation", e);
+        public CacheEntry(long lastModified, List<String> classes) {
+            this.lastModified = lastModified;
+            this.classes = classes;
         }
     }
 
     @Override
-    public List<String> getMixins() {
-        // Tell the Mixin engine to load these classes.
-        // Because they are on the Knot classpath now, Mixin will natively find them!
-        return dynamicallyCompiledMixins.isEmpty() ? null : dynamicallyCompiledMixins;
+    public void onLoad(String mixinPackage) {
+        try {
+            Path configDir = FabricLoader.getInstance().getConfigDir().resolve("dynpatcher");
+            Path cacheDir = configDir.resolve(".cache");
+            Files.createDirectories(configDir);
+            Files.createDirectories(cacheDir);
+
+            // 1. Load the Cache Map JSON
+            Path cacheMapFile = cacheDir.resolve("cache_map.json");
+            Map<String, CacheEntry> cacheMap = new HashMap<>();
+            Gson gson = new GsonBuilder().setPrettyPrinting().create();
+            if (Files.exists(cacheMapFile)) {
+                try (Reader reader = Files.newBufferedReader(cacheMapFile)) {
+                    Type type = new TypeToken<Map<String, CacheEntry>>(){}.getType();
+                    Map<String, CacheEntry> loaded = gson.fromJson(reader, type);
+                    if (loaded != null) cacheMap = loaded;
+                } catch (Exception ignored) {}
+            }
+
+            // 2. Discover Java files
+            List<Path> javaFiles;
+            try (Stream<Path> walk = Files.walk(configDir)) {
+                javaFiles = walk.filter(p -> p.toString().endsWith(".java")).collect(Collectors.toList());
+            }
+
+            if (javaFiles.isEmpty()) return;
+
+            List<Path> toCompile = new ArrayList<>();
+            Map<String, List<String>> packageToMixins = new HashMap<>();
+
+            // 3. Cache Validation
+            for (Path javaFile : javaFiles) {
+                String javaPathStr = javaFile.toAbsolutePath().toString();
+                long currentModified = Files.getLastModifiedTime(javaFile).toMillis();
+                CacheEntry entry = cacheMap.get(javaPathStr);
+
+                boolean validCache = false;
+                if (entry != null && entry.lastModified >= currentModified) {
+                    validCache = true;
+                    // Verify all compiled class files actually exist
+                    for (String clazz : entry.classes) {
+                        Path classFile = cacheDir.resolve(clazz.replace('.', '/') + ".class");
+                        if (!Files.exists(classFile)) {
+                            validCache = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (validCache) {
+                    // Cache Hit: Directly parse the cached .class files to check if they are Mixins
+                    for (String clazz : entry.classes) {
+                        Path classFile = cacheDir.resolve(clazz.replace('.', '/') + ".class");
+                        byte[] bytes = Files.readAllBytes(classFile);
+                        if (AsmRemapInjector.isMixinClass(bytes)) {
+                            registerClassInPackage(clazz, packageToMixins);
+                        }
+                    }
+                } else {
+                    // Cache Miss: Schedule compilation
+                    toCompile.add(javaFile);
+                }
+            }
+
+            // 4. Compilation of Out-Of-Date Files
+            if (!toCompile.isEmpty()) {
+                System.out.println("[DynPatcher] Compiling " + toCompile.size() + " out-of-date mixin sources...");
+
+                MemoryJavaFileManager memoryManager = null;
+                Map<String, byte[]> compiledClasses = Collections.emptyMap();
+                try {
+                    // Ensure the compiler receives our Custom Memory Manager
+                    compiledClasses = EcjRuntimeCompiler.compile(toCompile);
+                } catch (Exception e) {
+                    System.err.println("[DynPatcher] ECJ failed to run compiled classes. Skipping compilation.");
+                    e.printStackTrace();
+                }
+
+                if (!compiledClasses.isEmpty()) {
+                    // We must find our memory manager's source map
+                    // Since compile() returns a flat map, we query our compiler class for sourceToClasses
+                    Map<String, List<String>> sourceToClasses = EcjRuntimeCompiler.getLastSourceToClasses();
+
+                    for (Map.Entry<String, List<String>> srcEntry : sourceToClasses.entrySet()) {
+                        String sourcePath = srcEntry.getKey();
+                        List<String> generatedClassNames = srcEntry.getValue();
+                        List<String> validCacheClasses = new ArrayList<>();
+
+                        for (String fqcn : generatedClassNames) {
+                            byte[] classBytes = compiledClasses.get(fqcn);
+                            if (classBytes == null) continue;
+
+                            // Auto-inject remap = false
+                            classBytes = AsmRemapInjector.injectRemapFalse(classBytes);
+
+                            // Write to Cache
+                            Path classFile = cacheDir.resolve(fqcn.replace('.', '/') + ".class");
+                            Files.createDirectories(classFile.getParent());
+                            Files.write(classFile, classBytes);
+
+                            // Keep track of this class for mapping
+                            validCacheClasses.add(fqcn);
+
+                            // Check if this compiled class is actually a Mixin (skipping inner classes)
+                            if (!fqcn.contains("$") && AsmRemapInjector.isMixinClass(classBytes)) {
+                                registerClassInPackage(fqcn, packageToMixins);
+                            }
+                        }
+
+                        // Update the Cache map for this specific Java File
+                        Path javaFile = Paths.get(sourcePath);
+                        long modifiedTime = Files.getLastModifiedTime(javaFile).toMillis();
+                        cacheMap.put(sourcePath, new CacheEntry(modifiedTime, validCacheClasses));
+                    }
+
+                    // Save cache mapping back to disk
+                    try (Writer writer = Files.newBufferedWriter(cacheMapFile)) {
+                        gson.toJson(cacheMap, writer);
+                    }
+                }
+            }
+
+            // 5. Register the Cache Directory to classpath
+            FabricLauncherBase.getLauncher().addToClassPath(cacheDir);
+
+            // 6. Generate dynamic mixin configs for arbitrary packages
+            for (Map.Entry<String, List<String>> entry : packageToMixins.entrySet()) {
+                String pkg = entry.getKey();
+                List<String> classes = entry.getValue();
+
+                String configName = "dynpatcher." + (pkg.isEmpty() ? "default" : pkg) + ".json";
+                Path configFile = cacheDir.resolve(configName);
+
+                String json = generateMixinJson(pkg, classes);
+                Files.write(configFile, json.getBytes());
+
+                configNamesToLoad.add(configName);
+                System.out.println("[DynPatcher] Registered Mixin Config: " + configName + " (" + classes.size() + " classes)");
+            }
+
+        } catch (Exception e) {
+            System.err.println("[DynPatcher] Critical initialization failure!");
+            e.printStackTrace();
+        }
     }
 
-    // Required IMixinConfigPlugin boilerplates
+    private void registerClassInPackage(String rawFqcn, Map<String, List<String>> packageToMixins) {
+        String fqcn = rawFqcn.replace('/', '.');
+        int lastDot = fqcn.lastIndexOf('.');
+        String pkg = lastDot == -1 ? "" : fqcn.substring(0, lastDot);
+        String className = lastDot == -1 ? fqcn : fqcn.substring(lastDot + 1);
+        packageToMixins.computeIfAbsent(pkg, k -> new ArrayList<>()).add(className);
+    }
+
+    private String generateMixinJson(String pkg, List<String> classes) {
+        String classList = classes.stream().map(c -> "\"" + c + "\"").collect(Collectors.joining(",\n    "));
+        return "{\n" +
+               "  \"required\": true,\n" +
+               "  \"package\": \"" + pkg + "\",\n" +
+               "  \"compatibilityLevel\": \"JAVA_21\",\n" +
+               "  \"mixins\": [\n    " + classList + "\n  ],\n" +
+               "  \"injectors\": { \"defaultRequire\": 1 }\n" +
+               "}";
+    }
+    @Override
+    public void acceptTargets(Set<String> my, Set<String> other) {
+        for (String config : configNamesToLoad) {
+            Mixins.addConfiguration(config);
+        }
+        configNamesToLoad.clear();
+    }
+
+
+    @Override public List<String> getMixins() { return null; }
     @Override public String getRefMapperConfig() { return null; }
-    @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) { return true; }
-    @Override public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) {}
-    @Override public void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {}
-    @Override public void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {}
+    @Override public boolean shouldApplyMixin(String t, String m) { return true; }
+    @Override public void preApply(String t, ClassNode cn, String m, IMixinInfo i) {}
+    @Override public void postApply(String t, ClassNode cn, String m, IMixinInfo i) {}
 }

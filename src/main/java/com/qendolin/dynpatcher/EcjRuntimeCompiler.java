@@ -7,97 +7,80 @@ import org.eclipse.jdt.internal.compiler.tool.EclipseCompiler;
 import javax.tools.*;
 import java.io.File;
 import java.net.URI;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.stream.Collectors;
 
 public class EcjRuntimeCompiler {
+    private static Map<String, List<String>> lastSourceToClasses = Collections.emptyMap();
 
-    public static Map<String, byte[]> compile(List<Path> javaFiles) {
-        try {
-            // 1. Find the jar file that contains the ECJ compiler
-            java.net.URL ecjUrl = EclipseCompiler.class.getProtectionDomain().getCodeSource().getLocation();
+    public static Map<String, List<String>> getLastSourceToClasses() {
+        return lastSourceToClasses;
+    }
 
-            // 2. Create an isolated ClassLoader.
-            // We set the parent to the JVM Platform Classloader to completely bypass Knot and Mixin!
-            try (java.net.URLClassLoader isolatedLoader = new java.net.URLClassLoader(
-                new java.net.URL[]{ecjUrl},
-                ClassLoader.getPlatformClassLoader())) {
+    public static Map<String, byte[]> compile(List<Path> javaFiles) throws Exception {
+        URL ecjUrl = EclipseCompiler.class.getProtectionDomain().getCodeSource().getLocation();
 
-                // 3. Load the compiler completely isolated from Fabric
-                Class<?> compilerClass = isolatedLoader.loadClass("org.eclipse.jdt.internal.compiler.tool.EclipseCompiler");
-                JavaCompiler compiler = (JavaCompiler) compilerClass.getDeclaredConstructor().newInstance();
+        try (URLClassLoader isolatedLoader = new URLClassLoader(new URL[]{ecjUrl}, ClassLoader.getPlatformClassLoader())) {
 
-                // Setup Memory Manager
-                StandardJavaFileManager standardFileManager = compiler.getStandardFileManager(null, null, null);
-                MemoryJavaFileManager memoryFileManager = new MemoryJavaFileManager(standardFileManager);
+            Class<?> compilerClass = isolatedLoader.loadClass("org.eclipse.jdt.internal.compiler.tool.EclipseCompiler");
+            JavaCompiler compiler = (JavaCompiler) compilerClass.getDeclaredConstructor().newInstance();
 
-                // 1. Add a Diagnostic Collector to capture compiler errors/warnings
-                DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+            StandardJavaFileManager standardFileManager = compiler.getStandardFileManager(null, null, null);
+            MemoryJavaFileManager memoryFileManager = new MemoryJavaFileManager(standardFileManager);
+            DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
 
-                List<File> files = javaFiles.stream().map(Path::toFile).collect(Collectors.toList());
-                Iterable<? extends JavaFileObject> compilationUnits = standardFileManager.getJavaFileObjectsFromFiles(files);
+            List<File> files = javaFiles.stream().map(Path::toFile).collect(Collectors.toList());
+            Iterable<? extends JavaFileObject> units = standardFileManager.getJavaFileObjectsFromFiles(files);
 
-                // 2. Add "-proc:none" to disable the Mixin Annotation Processor
-                List<String> options = Arrays.asList(
-                    "-21",
-                    "-classpath", buildFabricClasspath()
-                );
+            // You can safely upgrade "-21" to "-25" when compiling strictly on Java 25
+            List<String> options = Arrays.asList("-21", "-proc:none", "-err:-publicType", "-classpath", buildFabricClasspath());
 
-                // 3. Pass the diagnostics collector here
-                JavaCompiler.CompilationTask task = compiler.getTask(null, memoryFileManager, diagnostics, options, null, compilationUnits);
+            JavaCompiler.CompilationTask task = compiler.getTask(null, memoryFileManager, diagnostics, options, null, units);
 
-                boolean success = task.call();
+            boolean success = task.call();
 
-                // 4. Print any compiler errors to the console so we can debug syntax issues
-                for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
-                    System.err.println("[ECJ Diagnostic] " + diagnostic.getKind() + ": " + diagnostic.getMessage(null));
-                    if (diagnostic.getSource() != null) {
-                        System.err.println(" -> Line " + diagnostic.getLineNumber() + " in " + diagnostic.getSource().getName());
+            // Store the compiled source-to-class mappings
+            lastSourceToClasses = memoryFileManager.getSourceToClasses();
+
+            for (Diagnostic<? extends JavaFileObject> diag : diagnostics.getDiagnostics()) {
+                if (diag.getKind() == Diagnostic.Kind.ERROR) {
+                    System.err.println("[DynPatcher Syntax Error] " + diag.getMessage(null));
+                    if (diag.getSource() != null) {
+                        System.err.println("   -> Line " + diag.getLineNumber() + " in " + new File(diag.getSource().toUri()).getName());
                     }
+                } else {
+                    System.out.println("[DynPatcher Info] " + diag.getMessage(null));
                 }
-
-                if (!success) {
-                    throw new RuntimeException("ECJ Compilation failed! Check the console for syntax errors.");
-                }
-
-                return memoryFileManager.getCompiledClasses();
             }
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to isolate ECJ compiler", e);
+
+            if (!success) {
+                System.err.println("[DynPatcher] Compilation completed with errors.");
+            }
+
+            return memoryFileManager.getCompiledClasses();
         }
     }
 
-    /**
-     * Extracts all loaded mods and game jars from Fabric Loader to feed into ECJ.
-     */
     private static String buildFabricClasspath() {
         Set<String> paths = new HashSet<>();
-
-        // 1. Add current JVM classpath (Fabric Loader itself, standard libraries)
         paths.addAll(Arrays.asList(System.getProperty("java.class.path").split(File.pathSeparator)));
 
-        // 2. Add all physical mods and the Minecraft Game Jar loaded by Fabric
         for (ModContainer mod : FabricLoader.getInstance().getAllMods()) {
             for (Path path : mod.getRootPaths()) {
                 try {
                     URI uri = path.toUri();
-                    // Fabric handles nested jars using the ZipFileSystem (jar://)
-                    // We must peel back the URI to get the underlying physical .jar file for ECJ
                     if ("jar".equals(uri.getScheme())) {
                         String spec = uri.getRawSchemeSpecificPart();
                         int bangIndex = spec.indexOf("!/");
-                        if (bangIndex != -1) spec = spec.substring(0, bangIndex);
-                        paths.add(Paths.get(new URI(spec)).toAbsolutePath().toString());
-                    }
-                    // Standard loose files / un-nested jars
-                    else if ("file".equals(uri.getScheme())) {
+                        paths.add(Paths.get(new URI(bangIndex != -1 ? spec.substring(0, bangIndex) : spec)).toAbsolutePath().toString());
+                    } else if ("file".equals(uri.getScheme())) {
                         paths.add(path.toAbsolutePath().toString());
                     }
-                } catch (Exception ignored) {
-                    // Ignore unparseable paths safely
-                }
+                } catch (Exception ignored) {}
             }
         }
         return String.join(File.pathSeparator, paths);
