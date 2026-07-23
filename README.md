@@ -5,7 +5,7 @@ Dynamically compile and load Mixin patches from source at runtime.
 ## User Guide
 
 ### Overview
-DynPatcher allows you to add or modify Fabric Mixins without recompiling the mod JAR. Source `.java` files placed in the patches directory are compiled at startup using an embedded Java compiler and registered with SpongePowered Mixin.
+DynPatcher allows you to add or modify Fabric Mixins without recompiling the mod JAR. Source `.java` files placed in the patches directory are compiled at startup using an embedded Java compiler and registered with Mixin.
 
 ### File Structure
 When the game launches with DynPatcher installed, the following directory structure is created in your `.minecraft/config/dynpatcher/` folder:
