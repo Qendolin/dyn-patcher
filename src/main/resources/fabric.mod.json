@@ -3,7 +3,7 @@
 	"id": "dynpatcher",
 	"version": "${version}",
 	"name": "dynpatcher",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"description": "Load ",
 	"authors": [
 		"Qendolin"
 	],
@@ -24,7 +24,7 @@
 	],
 	"depends": {
 		"fabricloader": ">=0.19.3",
-		"minecraft": "~26.1",
+		"minecraft": ">=26.1",
 		"java": ">=25"
 	}
 }

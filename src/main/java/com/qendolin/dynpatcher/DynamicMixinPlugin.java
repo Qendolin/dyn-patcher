@@ -1,217 +1,233 @@
 package com.qendolin.dynpatcher;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.reflect.TypeToken;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.impl.launch.FabricLauncherBase;
+import org.objectweb.asm.tree.ClassNode;
 import org.spongepowered.asm.mixin.Mixins;
 import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
 import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
-import org.objectweb.asm.tree.ClassNode;
 
-import java.io.Reader;
-import java.io.Writer;
-import java.lang.reflect.Type;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.attribute.FileTime;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+/**
+ * Central Mixin plugin that discovers, compiles, and registers dynamic Mixin classes
+ * from source files placed in {@code config/dynpatcher/patches/}.
+ */
 public class DynamicMixinPlugin implements IMixinConfigPlugin {
 
-    private final List<String> configNamesToLoad = new ArrayList<>();
-
-    public static class CacheEntry {
-        public long lastModified;
-        public List<String> classes;
-
-        public CacheEntry(long lastModified, List<String> classes) {
-            this.lastModified = lastModified;
-            this.classes = classes;
-        }
-    }
+    private final List<String> pendingConfigs = new ArrayList<>();
 
     @Override
     public void onLoad(String mixinPackage) {
         try {
             Path configDir = FabricLoader.getInstance().getConfigDir().resolve("dynpatcher");
+            Path patchesDir = configDir.resolve("patches");
             Path cacheDir = configDir.resolve(".cache");
+            Path configFile = configDir.resolve("config.json");
+
             Files.createDirectories(configDir);
+            Files.createDirectories(patchesDir);
             Files.createDirectories(cacheDir);
 
-            // 1. Load the Cache Map JSON
-            Path cacheMapFile = cacheDir.resolve("cache_map.json");
-            Map<String, CacheEntry> cacheMap = new HashMap<>();
-            Gson gson = new GsonBuilder().setPrettyPrinting().create();
-            if (Files.exists(cacheMapFile)) {
-                try (Reader reader = Files.newBufferedReader(cacheMapFile)) {
-                    Type type = new TypeToken<Map<String, CacheEntry>>(){}.getType();
-                    Map<String, CacheEntry> loaded = gson.fromJson(reader, type);
-                    if (loaded != null) cacheMap = loaded;
-                } catch (Exception ignored) {}
-            }
+            // ── 0. Load config.json ──────────────────────────────────────────
+            PatcherConfig patcherConfig = PatcherConfig.loadOrCreate(configFile);
 
-            // 2. Discover Java files
+            // ── 1. Discover source files under patches/ ──────────────────────
             List<Path> javaFiles;
-            try (Stream<Path> walk = Files.walk(configDir)) {
-                javaFiles = walk.filter(p -> p.toString().endsWith(".java")).collect(Collectors.toList());
+            try (Stream<Path> walk = Files.walk(patchesDir)) {
+                javaFiles = walk
+                        .filter(p -> p.toString().endsWith(".java"))
+                        .collect(Collectors.toList());
             }
 
-            if (javaFiles.isEmpty()) return;
+            if (javaFiles.isEmpty()) {
+                DynamicPatcher.LOGGER.info("[DynPatcher] No source files found in '{}'.", patchesDir);
+                return;
+            }
 
-            List<Path> toCompile = new ArrayList<>();
-            Map<String, List<String>> packageToMixins = new HashMap<>();
+            // ── 2. Determine Mod Version & Load Cache ────────────────────────
+            String modVersion = FabricLoader.getInstance()
+                    .getModContainer(DynamicPatcher.MOD_ID)
+                    .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
+                    .orElse("unknown");
 
-            // 3. Cache Validation
+            CompilationCache cache = new CompilationCache(cacheDir, patchesDir, modVersion);
+            cache.load();
+
+            // ── 3. Classify files & Check disabled status ───────────────────
+            List<MixinSource> toCompile = new ArrayList<>();
+            List<String> allMixinFqcns = new ArrayList<>();
+
             for (Path javaFile : javaFiles) {
-                String javaPathStr = javaFile.toAbsolutePath().toString();
-                long currentModified = Files.getLastModifiedTime(javaFile).toMillis();
-                CacheEntry entry = cacheMap.get(javaPathStr);
+                String relPath = patchesDir.relativize(javaFile.toAbsolutePath()).toString().replace('\\', '/');
 
-                boolean validCache = false;
-                if (entry != null && entry.lastModified >= currentModified) {
-                    validCache = true;
-                    // Verify all compiled class files actually exist
-                    for (String clazz : entry.classes) {
-                        Path classFile = cacheDir.resolve(clazz.replace('.', '/') + ".class");
-                        if (!Files.exists(classFile)) {
-                            validCache = false;
-                            break;
-                        }
-                    }
+                if (patcherConfig.isPatchDisabled(relPath)) {
+                    DynamicPatcher.LOGGER.info("[DynPatcher] Patch '{}' is disabled in config.json; skipping.", relPath);
+                    continue;
                 }
 
-                if (validCache) {
-                    // Cache Hit: Directly parse the cached .class files to check if they are Mixins
-                    for (String clazz : entry.classes) {
-                        Path classFile = cacheDir.resolve(clazz.replace('.', '/') + ".class");
-                        byte[] bytes = Files.readAllBytes(classFile);
-                        if (AsmRemapInjector.isMixinClass(bytes)) {
-                            registerClassInPackage(clazz, packageToMixins);
-                        }
-                    }
+                CompilationCache.ResolveResult result = cache.resolve(javaFile);
+                if (result.isHit()) {
+                    List<String> cachedClasses = result.classes();
+                    List<String> mixins = collectMixinsFromCache(cachedClasses, cacheDir);
+                    DynamicPatcher.LOGGER.info(
+                            "[DynPatcher] Reusing cached class(es) {} for patch '{}' (cache hit: {}).",
+                            cachedClasses, relPath, result.hitReason());
+                    allMixinFqcns.addAll(mixins);
                 } else {
-                    // Cache Miss: Schedule compilation
-                    toCompile.add(javaFile);
+                    DynamicPatcher.LOGGER.info(
+                            "[DynPatcher] Queueing patch '{}' for compilation (cache miss: {}).",
+                            relPath, result.missReason());
+                    try {
+                        toCompile.add(SourcePreprocessor.process(javaFile));
+                    } catch (IOException e) {
+                        DynamicPatcher.LOGGER.error(
+                                "[DynPatcher] Could not read patch '{}'; skipping. Reason: {}",
+                                relPath, e.getMessage());
+                    }
                 }
             }
 
-            // 4. Compilation of Out-Of-Date Files
+            // ── 4. Compile queued sources ─────────────────────────────────────
             if (!toCompile.isEmpty()) {
-                System.out.println("[DynPatcher] Compiling " + toCompile.size() + " out-of-date mixin sources...");
-
-                MemoryJavaFileManager memoryManager = null;
-                Map<String, byte[]> compiledClasses = Collections.emptyMap();
+                DynamicPatcher.LOGGER.info("[DynPatcher] Compiling {} source patch(es)...", toCompile.size());
                 try {
-                    // Ensure the compiler receives our Custom Memory Manager
-                    compiledClasses = EcjRuntimeCompiler.compile(toCompile);
+                    EcjRuntimeCompiler.CompilationResult compilationResult = EcjRuntimeCompiler.compile(toCompile);
+                    allMixinFqcns.addAll(processCompilationResult(compilationResult, toCompile, cache, patchesDir));
                 } catch (Exception e) {
-                    System.err.println("[DynPatcher] ECJ failed to run compiled classes. Skipping compilation.");
-                    e.printStackTrace();
-                }
-
-                if (!compiledClasses.isEmpty()) {
-                    // We must find our memory manager's source map
-                    // Since compile() returns a flat map, we query our compiler class for sourceToClasses
-                    Map<String, List<String>> sourceToClasses = EcjRuntimeCompiler.getLastSourceToClasses();
-
-                    for (Map.Entry<String, List<String>> srcEntry : sourceToClasses.entrySet()) {
-                        String sourcePath = srcEntry.getKey();
-                        List<String> generatedClassNames = srcEntry.getValue();
-                        List<String> validCacheClasses = new ArrayList<>();
-
-                        for (String fqcn : generatedClassNames) {
-                            byte[] classBytes = compiledClasses.get(fqcn);
-                            if (classBytes == null) continue;
-
-                            // Auto-inject remap = false
-                            classBytes = AsmRemapInjector.injectRemapFalse(classBytes);
-
-                            // Write to Cache
-                            Path classFile = cacheDir.resolve(fqcn.replace('.', '/') + ".class");
-                            Files.createDirectories(classFile.getParent());
-                            Files.write(classFile, classBytes);
-
-                            // Keep track of this class for mapping
-                            validCacheClasses.add(fqcn);
-
-                            // Check if this compiled class is actually a Mixin (skipping inner classes)
-                            if (!fqcn.contains("$") && AsmRemapInjector.isMixinClass(classBytes)) {
-                                registerClassInPackage(fqcn, packageToMixins);
-                            }
-                        }
-
-                        // Update the Cache map for this specific Java File
-                        Path javaFile = Paths.get(sourcePath);
-                        long modifiedTime = Files.getLastModifiedTime(javaFile).toMillis();
-                        cacheMap.put(sourcePath, new CacheEntry(modifiedTime, validCacheClasses));
-                    }
-
-                    // Save cache mapping back to disk
-                    try (Writer writer = Files.newBufferedWriter(cacheMapFile)) {
-                        gson.toJson(cacheMap, writer);
-                    }
+                    DynamicPatcher.LOGGER.error("[DynPatcher] Compilation failed unexpectedly.", e);
                 }
             }
 
-            // 5. Register the Cache Directory to classpath
+            if (allMixinFqcns.isEmpty()) {
+                DynamicPatcher.LOGGER.info("[DynPatcher] No active @Mixin classes found.");
+                cache.flush();
+                return;
+            }
+
+            // ── 5. Add cache directory to classpath ───────────────────────────
             FabricLauncherBase.getLauncher().addToClassPath(cacheDir);
 
-            // 6. Generate dynamic mixin configs for arbitrary packages
-            for (Map.Entry<String, List<String>> entry : packageToMixins.entrySet()) {
+            // ── 6. Generate per-package Mixin configs ─────────────────────────
+            Map<String, List<String>> byPackage = MixinConfigGenerator.groupByPackage(allMixinFqcns);
+            for (Map.Entry<String, List<String>> entry : byPackage.entrySet()) {
                 String pkg = entry.getKey();
-                List<String> classes = entry.getValue();
+                List<String> simpleNames = entry.getValue();
 
-                String configName = "dynpatcher." + (pkg.isEmpty() ? "default" : pkg) + ".json";
-                Path configFile = cacheDir.resolve(configName);
+                if (pkg.isEmpty()) {
+                    DynamicPatcher.LOGGER.error(
+                            "[DynPatcher] Skipping {} Mixin class(es) with no package — this is a bug.",
+                            simpleNames.size());
+                    continue;
+                }
 
-                String json = generateMixinJson(pkg, classes);
-                Files.write(configFile, json.getBytes());
+                try {
+                    String configName = MixinConfigGenerator.generate(cacheDir, pkg, simpleNames);
+                    pendingConfigs.add(configName);
+                    DynamicPatcher.LOGGER.info(
+                            "[DynPatcher] Registered Mixin config '{}' ({} class(es)).",
+                            configName, simpleNames.size());
+                } catch (IOException e) {
+                    DynamicPatcher.LOGGER.error(
+                            "[DynPatcher] Could not write Mixin config for package '{}'.", pkg, e);
+                }
+            }
 
-                configNamesToLoad.add(configName);
-                System.out.println("[DynPatcher] Registered Mixin Config: " + configName + " (" + classes.size() + " classes)");
+            // ── 7. Save cache index ───────────────────────────────────────────
+            try {
+                cache.flush();
+            } catch (IOException e) {
+                DynamicPatcher.LOGGER.warn("[DynPatcher] Failed to save cache index.", e);
             }
 
         } catch (Exception e) {
-            System.err.println("[DynPatcher] Critical initialization failure!");
-            e.printStackTrace();
+            DynamicPatcher.LOGGER.error("[DynPatcher] Critical initialization failure.", e);
         }
     }
 
-    private void registerClassInPackage(String rawFqcn, Map<String, List<String>> packageToMixins) {
-        String fqcn = rawFqcn.replace('/', '.');
-        int lastDot = fqcn.lastIndexOf('.');
-        String pkg = lastDot == -1 ? "" : fqcn.substring(0, lastDot);
-        String className = lastDot == -1 ? fqcn : fqcn.substring(lastDot + 1);
-        packageToMixins.computeIfAbsent(pkg, k -> new ArrayList<>()).add(className);
-    }
-
-    private String generateMixinJson(String pkg, List<String> classes) {
-        String classList = classes.stream().map(c -> "\"" + c + "\"").collect(Collectors.joining(",\n    "));
-        return "{\n" +
-               "  \"required\": true,\n" +
-               "  \"package\": \"" + pkg + "\",\n" +
-               "  \"compatibilityLevel\": \"JAVA_21\",\n" +
-               "  \"mixins\": [\n    " + classList + "\n  ],\n" +
-               "  \"injectors\": { \"defaultRequire\": 1 }\n" +
-               "}";
-    }
     @Override
-    public void acceptTargets(Set<String> my, Set<String> other) {
-        for (String config : configNamesToLoad) {
+    public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) {
+        for (String config : pendingConfigs) {
             Mixins.addConfiguration(config);
         }
-        configNamesToLoad.clear();
+        pendingConfigs.clear();
     }
 
+    private List<String> collectMixinsFromCache(List<String> fqcns, Path cacheDir) {
+        List<String> mixins = new ArrayList<>();
+        for (String fqcn : fqcns) {
+            if (fqcn.contains("$")) continue;
+            Path classFile = cacheDir.resolve(fqcn.replace('.', '/') + ".class");
+            try {
+                if (AsmRemapInjector.isMixinClass(Files.readAllBytes(classFile))) {
+                    mixins.add(fqcn);
+                }
+            } catch (IOException e) {
+                DynamicPatcher.LOGGER.warn(
+                        "[DynPatcher] Could not read cached class '{}': {}", fqcn, e.getMessage());
+            }
+        }
+        return mixins;
+    }
+
+    private List<String> processCompilationResult(
+            EcjRuntimeCompiler.CompilationResult result,
+            List<MixinSource> sources,
+            CompilationCache cache,
+            Path patchesDir) {
+
+        List<String> mixinFqcns = new ArrayList<>();
+
+        for (MixinSource source : sources) {
+            String absPath = source.path().toAbsolutePath().toString();
+            String relPath = patchesDir.relativize(source.path().toAbsolutePath()).toString().replace('\\', '/');
+            List<String> classNames = result.sourceToClasses().get(absPath);
+
+            if (classNames == null || classNames.isEmpty()) {
+                DynamicPatcher.LOGGER.warn(
+                        "[DynPatcher] No compiled classes produced for patch '{}'. Check compiler output.",
+                        relPath);
+                continue;
+            }
+
+            Map<String, byte[]> processedBytes = new HashMap<>();
+            List<String> validFqcns = new ArrayList<>();
+
+            for (String fqcn : classNames) {
+                byte[] bytes = result.compiledClasses().get(fqcn);
+                if (bytes == null) continue;
+
+                bytes = AsmRemapInjector.injectRemapFalse(bytes);
+                processedBytes.put(fqcn, bytes);
+                validFqcns.add(fqcn);
+
+                if (!fqcn.contains("$") && AsmRemapInjector.isMixinClass(bytes)) {
+                    mixinFqcns.add(fqcn);
+                }
+            }
+
+            try {
+                cache.store(source.path(), validFqcns, processedBytes);
+                DynamicPatcher.LOGGER.info(
+                        "[DynPatcher] Successfully compiled and cached patch '{}' -> classes: {}",
+                        relPath, validFqcns);
+            } catch (IOException e) {
+                DynamicPatcher.LOGGER.error(
+                        "[DynPatcher] Failed to cache compiled classes for patch '{}'.", relPath, e);
+            }
+        }
+
+        return mixinFqcns;
+    }
 
     @Override public List<String> getMixins() { return null; }
     @Override public String getRefMapperConfig() { return null; }
-    @Override public boolean shouldApplyMixin(String t, String m) { return true; }
+    @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) { return true; }
     @Override public void preApply(String t, ClassNode cn, String m, IMixinInfo i) {}
     @Override public void postApply(String t, ClassNode cn, String m, IMixinInfo i) {}
 }
