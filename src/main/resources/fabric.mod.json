@@ -2,8 +2,8 @@
 	"schemaVersion": 1,
 	"id": "dynpatcher",
 	"version": "${version}",
-	"name": "dynpatcher",
-	"description": "Load ",
+	"name": "Dynamic Patcher",
+	"description": "Dynamically compile and load Mixin patches from source at runtime.",
 	"authors": [
 		"Qendolin"
 	],
