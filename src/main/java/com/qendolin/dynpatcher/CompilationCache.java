@@ -7,7 +7,6 @@ import com.google.gson.reflect.TypeToken;
 import java.io.*;
 import java.lang.reflect.Type;
 import java.nio.file.*;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.stream.Stream;
@@ -198,7 +197,7 @@ public class CompilationCache {
     }
 
     private String toRelativeKey(Path javaFile) {
-        return patchesDir.relativize(javaFile.toAbsolutePath()).toString().replace('\\', '/');
+        return patchesDir.relativize(javaFile.toAbsolutePath().normalize()).toString().replace('\\', '/');
     }
 
     private static String computeHash(Path file) throws Exception {

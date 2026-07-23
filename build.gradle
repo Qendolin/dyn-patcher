@@ -7,6 +7,7 @@ version = project.mod_version
 group = project.maven_group
 
 repositories {
+	maven { url = "https://maven.bawnorton.com/releases" }
 }
 
 dependencies {
@@ -15,6 +16,7 @@ dependencies {
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
 	include(implementation("org.eclipse.jdt:ecj:${project.ecj_version}"))
+	include(implementation(annotationProcessor("com.github.bawnorton.mixinsquared:mixinsquared-fabric:0.3.7-beta.3")))
 }
 
 processResources {
@@ -24,6 +26,8 @@ processResources {
 	filesMatching("fabric.mod.json") {
 		expand "version": version
 	}
+
+	exclude("**/*.xcf")
 }
 
 tasks.withType(JavaCompile).configureEach {

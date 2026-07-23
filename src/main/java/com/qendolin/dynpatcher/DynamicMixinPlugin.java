@@ -1,5 +1,6 @@
 package com.qendolin.dynpatcher;
 
+import com.bawnorton.mixinsquared.MixinSquaredBootstrap;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.impl.launch.FabricLauncherBase;
 import org.objectweb.asm.tree.ClassNode;
@@ -11,7 +12,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -24,11 +24,18 @@ public class DynamicMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public void onLoad(String mixinPackage) {
+
         try {
-            Path configDir = FabricLoader.getInstance().getConfigDir().resolve("dynpatcher");
-            Path patchesDir = configDir.resolve("patches");
-            Path cacheDir = configDir.resolve(".cache");
-            Path configFile = configDir.resolve("config.json");
+            MixinSquaredBootstrap.init();
+        } catch (Throwable t) {
+            DynamicPatcher.LOGGER.error("[DynPatcher] Failed to initialize Mixin Squared", t);
+        }
+
+        try {
+            Path configDir = FabricLoader.getInstance().getConfigDir().resolve("dynpatcher").toAbsolutePath().normalize();
+            Path patchesDir = configDir.resolve("patches").toAbsolutePath().normalize();
+            Path cacheDir = configDir.resolve(".cache").toAbsolutePath().normalize();
+            Path configFile = configDir.resolve("config.json").toAbsolutePath().normalize();
 
             Files.createDirectories(configDir);
             Files.createDirectories(patchesDir);
@@ -42,7 +49,8 @@ public class DynamicMixinPlugin implements IMixinConfigPlugin {
             try (Stream<Path> walk = Files.walk(patchesDir)) {
                 javaFiles = walk
                         .filter(p -> p.toString().endsWith(".java"))
-                        .collect(Collectors.toList());
+                        .map(p -> p.toAbsolutePath().normalize())
+                        .toList();
             }
 
             if (javaFiles.isEmpty()) {
@@ -64,7 +72,7 @@ public class DynamicMixinPlugin implements IMixinConfigPlugin {
             List<String> allMixinFqcns = new ArrayList<>();
 
             for (Path javaFile : javaFiles) {
-                String relPath = patchesDir.relativize(javaFile.toAbsolutePath()).toString().replace('\\', '/');
+                String relPath = patchesDir.relativize(javaFile).toString().replace('\\', '/');
 
                 if (patcherConfig.isPatchDisabled(relPath)) {
                     DynamicPatcher.LOGGER.info("[DynPatcher] Patch '{}' is disabled in config.json; skipping.", relPath);
@@ -164,7 +172,7 @@ public class DynamicMixinPlugin implements IMixinConfigPlugin {
             if (fqcn.contains("$")) continue;
             Path classFile = cacheDir.resolve(fqcn.replace('.', '/') + ".class");
             try {
-                if (AsmRemapInjector.isMixinClass(Files.readAllBytes(classFile))) {
+                if (AsmRemapInjector.shouldLoadMixin(Files.readAllBytes(classFile))) {
                     mixins.add(fqcn);
                 }
             } catch (IOException e) {
@@ -184,9 +192,9 @@ public class DynamicMixinPlugin implements IMixinConfigPlugin {
         List<String> mixinFqcns = new ArrayList<>();
 
         for (MixinSource source : sources) {
-            String absPath = source.path().toAbsolutePath().toString();
-            String relPath = patchesDir.relativize(source.path().toAbsolutePath()).toString().replace('\\', '/');
-            List<String> classNames = result.sourceToClasses().get(absPath);
+            Path absPath = source.path().toAbsolutePath().normalize();
+            String relPath = patchesDir.relativize(absPath).toString().replace('\\', '/');
+            List<String> classNames = result.sourceToClasses().get(absPath.toString());
 
             if (classNames == null || classNames.isEmpty()) {
                 DynamicPatcher.LOGGER.warn(
@@ -206,7 +214,7 @@ public class DynamicMixinPlugin implements IMixinConfigPlugin {
                 processedBytes.put(fqcn, bytes);
                 validFqcns.add(fqcn);
 
-                if (!fqcn.contains("$") && AsmRemapInjector.isMixinClass(bytes)) {
+                if (!fqcn.contains("$") && AsmRemapInjector.shouldLoadMixin(bytes)) {
                     mixinFqcns.add(fqcn);
                 }
             }
@@ -225,7 +233,15 @@ public class DynamicMixinPlugin implements IMixinConfigPlugin {
         return mixinFqcns;
     }
 
-    @Override public List<String> getMixins() { return null; }
+    @Override public List<String> getMixins() {
+        try {
+            MixinSquaredBootstrap.reOrderExtensions();
+        } catch (Throwable t) {
+            DynamicPatcher.LOGGER.error("[DynPatcher] Failed to re-order extensions from Mixin Squared.", t);
+        }
+        return null;
+    }
+
     @Override public String getRefMapperConfig() { return null; }
     @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) { return true; }
     @Override public void preApply(String t, ClassNode cn, String m, IMixinInfo i) {}

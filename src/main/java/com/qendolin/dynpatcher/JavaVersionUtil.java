@@ -43,10 +43,8 @@ public class JavaVersionUtil {
         int maxFound = 21; // Baseline fallback
         for (int v = 30; v >= 8; v--) {
             try {
-                Field field = CompilerOptions.class.getField("VERSION_" + v);
-                if (field != null) {
-                    return v;
-                }
+                CompilerOptions.class.getField("VERSION_" + v);
+                return v;
             } catch (NoSuchFieldException ignored) {}
         }
         return maxFound;

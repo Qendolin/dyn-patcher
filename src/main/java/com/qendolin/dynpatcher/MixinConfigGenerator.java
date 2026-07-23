@@ -28,8 +28,8 @@ public class MixinConfigGenerator {
 
     public static String generate(Path cacheDir, String pkg, List<String> simpleNames) throws IOException {
         String configName = "dynpatcher." + pkg + ".json";
-        Files.write(cacheDir.resolve(configName),
-                buildJson(pkg, simpleNames).getBytes(StandardCharsets.UTF_8));
+        Files.writeString(cacheDir.resolve(configName),
+            buildJson(pkg, simpleNames));
         return configName;
     }
 

@@ -34,7 +34,7 @@ public class MemoryJavaFileManager extends ForwardingJavaFileManager<StandardJav
                                                 JavaFileObject.Kind kind, FileObject sibling) {
         if (sibling != null) {
             try {
-                String sourcePath = Paths.get(sibling.toUri()).toAbsolutePath().toString();
+                String sourcePath = Paths.get(sibling.toUri()).toAbsolutePath().normalize().toString();
                 sourceToClasses
                         .computeIfAbsent(sourcePath, k -> Collections.synchronizedList(new ArrayList<>()))
                         .add(className);

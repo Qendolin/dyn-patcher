@@ -62,7 +62,7 @@ public class EcjRuntimeCompiler {
     private static List<JavaFileObject> buildSourceObjects(List<MixinSource> sources) {
         List<JavaFileObject> objects = new ArrayList<>(sources.size());
         for (MixinSource source : sources) {
-            URI uri = source.path().toUri();
+            URI uri = source.path().toAbsolutePath().normalize().toUri();
             String content = source.processedSource();
             objects.add(new SimpleJavaFileObject(uri, JavaFileObject.Kind.SOURCE) {
                 @Override
@@ -98,8 +98,7 @@ public class EcjRuntimeCompiler {
     }
 
     private static String buildClasspath() {
-        Set<String> paths = new LinkedHashSet<>();
-        paths.addAll(Arrays.asList(System.getProperty("java.class.path").split(File.pathSeparator)));
+        Set<String> paths = new LinkedHashSet<>(Arrays.asList(System.getProperty("java.class.path").split(File.pathSeparator)));
 
         for (ModContainer mod : FabricLoader.getInstance().getAllMods()) {
             for (Path root : mod.getRootPaths()) {
