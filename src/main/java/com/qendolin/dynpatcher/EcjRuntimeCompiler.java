@@ -9,9 +9,14 @@ import java.io.File;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.FileSystemNotFoundException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * Compiles Mixin source files at runtime using the Eclipse Compiler for Java (ECJ).
@@ -104,13 +109,29 @@ public class EcjRuntimeCompiler {
             for (Path root : mod.getRootPaths()) {
                 try {
                     URI uri = root.toUri();
-                    if ("jar".equals(uri.getScheme())) {
+                    String scheme = uri.getScheme();
+                    if ("jar".equals(scheme)) {
                         String spec = uri.getRawSchemeSpecificPart();
                         int bang = spec.indexOf("!/");
                         paths.add(Paths.get(new URI(bang != -1 ? spec.substring(0, bang) : spec))
                                 .toAbsolutePath().toString());
-                    } else if ("file".equals(uri.getScheme())) {
+                    } else if ("file".equals(scheme)) {
                         paths.add(root.toAbsolutePath().toString());
+                    } else {
+                        Path temp = Files.createTempFile("dynpatcher-classpath-", ".jar");
+                        temp.toFile().deleteOnExit();
+
+                        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(temp));
+                            Stream<Path> files = Files.walk(root)) {
+                            for (Path file : files.filter(Files::isRegularFile).toList()) {
+                                zip.putNextEntry(new ZipEntry(root.relativize(file).toString().replace('\\', '/')));
+                                Files.copy(file, zip);
+                                zip.closeEntry();
+                            }
+                        }
+
+                        paths.add(temp.toString());
+                        continue;
                     }
                 } catch (Exception ignored) {}
             }
